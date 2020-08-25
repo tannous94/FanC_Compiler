@@ -1,0 +1,1697 @@
+%{
+	#include "hw3_output.hpp"
+	#include "parser.hpp"
+	#include "bp.hpp"
+	#include "globalLabel.hpp"
+	#include <iostream>
+	#include <sstream>
+	using namespace output;
+	using namespace std;
+	extern int yylex();
+	extern int yylineno;
+	
+	void yyerror(char const*);
+	bool findID(string id);
+	string getEnumID(string id);
+	int getSerialEnum(string var_name);
+	void outerScopeBegin();
+	void outerScopeEnd();
+	void scopeBegin();
+	void scopeEnd();
+	void insertToStackTable(IdData* id, Types type);
+	void insertEnumToStackTable(IdData* id, Types type, string name);
+	int sameType(Types type1, Types type2);
+	int sameTypeEnums(Types type1, Types type2);
+	SymbolTable* getSymbolTable(const string& value);
+	void fromTypeToString(SymbolTable* sym, vector<Types>& types, vector<string>& strings);
+	bool isLoop();
+	void scopeDelete(); 
+	void whileCreate();
+	int isNumber(Types type);
+	void getEnums(vector<TypeData*>& src, vector<string>& dst);
+	
+	bool isInList(string enum_str, string var_name);
+	
+	const string typesAsString[ENUMS_TYPE + 1] = { "VOID", "INT", "STRING", "BYTE", "BOOL", "ENUMS", "ENUMS_TYPE" };
+	
+	//vector<Function*> funcs;
+	vector<TablesStack*> stack_table;
+	vector<EnumsData*> enums_list;
+	vector<int> offset_vector;
+	int curr_line = 0;
+	
+	int reg_count = 0;
+	string genReg();
+	//vector<string> regs;
+%}
+
+%token <token_data> EF BINOPADD BINOPMUL EQUALITY RELATION OR AND NOT FALSE TRUE STRING NUM NUM_B ENUM LPAREN RPAREN BOOL BYTE INT COMMA CONTINUE SC BREAK WHILE IF ELSE RETURN ASSIGN LBRACE RBRACE VOID
+%token <id_data> ID
+%type  <type_data> Type RetType Enumerator FuncSignature
+%type  <exp_list_data> ExpList
+%type  <exp_data> Exp Call ExpMarker IF_STATE WHILE_STATE
+%type  <formal_decl_data> FormalDecl EnumType
+%type  <formals_data> Formals FormalsList
+/*%type  <enum_decl_data> EnumDecl*/
+%type  <enum_data> EnumeratorList
+%type  <statement_data> Statement Statements statement_start closed_statement simple_statement N
+%type  <m_data> M
+
+%nonassoc SC
+%nonassoc IF
+%nonassoc NON
+%nonassoc ELSE
+%right ASSIGN
+%left OR
+%left AND
+%left EQUALITY
+%nonassoc RELATION
+%left BINOPADD
+%left BINOPMUL
+%right NOT
+%left LPAREN RPAREN LBRACE RBRACE
+
+%%
+
+Program : { outerScopeBegin(); } Enums Funcs MARKER { 
+
+outerScopeEnd(); 
+
+    CodeBuffer::instance().printGlobalBuffer();
+	CodeBuffer::instance().printCodeBuffer();
+	string tmp1= genReg();
+    CodeBuffer::instance().emit("call void @exit(i32 1)");
+	exit(0); 
+}
+;
+
+MARKER : EF { }
+;
+
+Funcs : /* epsilon */ { }
+		| FuncDecl Funcs { }
+;
+
+FuncDecl : FuncSignature LBRACE Statements RBRACE {
+	TablesStack* fun_table = stack_table[0];
+	SymbolTable* sig = fun_table->tables.back();
+
+	CodeBuffer::instance().bpatch( $3->nextList, CodeBuffer::instance().genLabel());
+	scopeEnd();
+	
+	
+	if ($1->getType() == VOIDS) {
+		//CodeBuffer::instance().bpatch( $3->nextList, CodeBuffer::instance().genLabel());
+		CodeBuffer::instance().emit("br label %ret_void");
+		CodeBuffer::instance().emit("ret_void:");
+		CodeBuffer::instance().emit("ret void }");
+    }
+
+	else {
+	string tmp = genReg();
+	CodeBuffer::instance().emit(tmp + " = add i32 0, 1");
+	CodeBuffer::instance().emit("ret i32 "+tmp+" }");
+	}
+}
+;
+
+FuncSignature : RetType LineMarker ID LPAREN Formals RPAREN {
+	$$ = $1;
+	if (findID($3->getValue())) {
+		errorDef(curr_line, $3->getValue());
+		exit(0);
+	}
+	if ($3->getValue() == "main" && findID($3->getValue())) {
+		errorDef(curr_line, $3->getValue());
+		exit(0);
+	}
+	TablesStack* sig_table = stack_table.back();
+	vector<Types> types;
+	vector<string> enum_args;
+	for (int i = 0; i < $5->formalsList.size(); i++) {
+		types.push_back($5->formalsList[i]->getType());
+		if ($5->formalsList[i]->getType() == ENUMS_TYPE)
+			enum_args.push_back($5->formalsList[i]->enum_id);
+		else
+			enum_args.push_back("");
+	}
+		
+	SymbolTable* func = new SymbolTable($3->getValue(), 0, $1->getType(), types, enum_args);
+	func->is_fun = true;
+	sig_table->tables.push_back(func);
+	sig_table = new TablesStack();
+	int offset = -1;
+	vector<FormalDeclData*> formals_list = $5->formalsList;
+	for(int i = formals_list.size() - 1; i >= 0; i--) {
+		SymbolTable* sym;
+		if (findID(formals_list[i]->name)) {
+			errorDef(yylineno, formals_list[i]->name);
+			exit(0);
+		}
+		if (formals_list[i]->getType() == ENUMS_TYPE)
+			sym = new SymbolTable(formals_list[i]->name, offset, formals_list[i]->getType(), formals_list[i]->enum_id);
+		else
+			sym = new SymbolTable(formals_list[i]->name, offset, formals_list[i]->getType(), "");
+		sig_table->tables.push_back(sym);
+		offset--;
+	}
+	
+	
+	offset_vector.push_back(0);
+	stack_table.push_back(sig_table);
+	if ($1->getType() != VOIDS)
+		CodeBuffer::instance().emit("define i32 @" + $3->getValue() + "(");
+	else
+		CodeBuffer::instance().emit("define void @" + $3->getValue() + "(");
+	
+	
+	for(int i = formals_list.size() - 1; i >= 0; i--) {
+		if (i == 0)
+			CodeBuffer::instance().emit("i32");
+		else		
+			CodeBuffer::instance().emit("i32,");
+	}
+	CodeBuffer::instance().emit(") {");
+			stringstream siz;
+		siz << formals_list.size();
+	CodeBuffer::instance().emit("%local_base = alloca [50 x i32]");
+	CodeBuffer::instance().emit("%arg_base = alloca [50 x i32]");
+	CodeBuffer::instance().emit("%local_counter = alloca i32");
+	CodeBuffer::instance().emit("store i32 0, i32* %local_counter");
+	CodeBuffer::instance().emit("%arg_counter = add i32 0, " + siz.str());
+	
+
+	for (int i = 0; i < formals_list.size(); i++) {
+		stringstream index;
+		string addr_in_stack = genReg();
+		index << i;
+		stringstream siz;
+		siz << formals_list.size();
+		CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %arg_base, i32 0, i32 " + index.str());
+		CodeBuffer::instance().emit("store i32 %" + index.str() + ", i32* " + addr_in_stack);
+	}
+
+	// CHECK if the code below is correct !
+	/*Function* new_fun = new Function($3->getValue());
+	string local = genReg();
+	string args = genReg();
+	CodeBuffer::instance().emit(local + " = alloca [50 x i32]");
+	CodeBuffer::instance().emit(args + " = alloca [" + formals_list.size() + " x i32]");
+	
+	new_fun->local_base = local;
+	new_fun->arg_base = args;
+	
+	
+	funcs.push_back(new_fun);*/
+	
+}
+;
+
+/* DO ENUMS HERE */
+Enums : /* epsilon */ { /*$$ = new EnumsData();*/ }
+		| EnumDecl Enums { /*printProductionRule(6);*/ }
+;
+
+EnumDecl : ENUM ID LBRACE EnumeratorList RBRACE SC {
+							TablesStack* fun_table = stack_table[stack_table.size() - 1];
+							if (findID($2->getValue())) {
+								errorDef(yylineno, $2->getValue());
+								exit(0);
+							}
+							if ($4->enumList.size() == 0) {
+								errorSyn(yylineno);
+								exit(0);
+							}
+							insertToStackTable($2, ENUMS_TYPE);
+							$4->name = $2->getValue();
+							enums_list.push_back($4);
+
+						}
+;
+
+RetType : Type { $$ = $1; }
+		  | VOID { 
+			$$ = new TypeData(VOIDS);
+		  }
+;
+
+Formals : /* epsilon */ { $$ = new FormalsData(); }
+		  | FormalsList { $$ = $1; }
+;
+
+FormalsList : FormalDecl { 
+							$$ = new FormalsData();
+							$$->formalsList.push_back($1); 
+						 }
+			  | FormalDecl COMMA FormalsList {
+												$3->formalsList.push_back($1);
+												$$ = $3;
+											 }
+;
+
+FormalDecl : Type ID {	
+                       
+					   if (findID($2->getValue())) {
+
+											errorDef(yylineno, $2->getValue());
+											exit(0);
+										}
+						$2->type = $1->getType();
+						$$ = new FormalDeclData($1->getType(), $2->getValue());
+					 }
+			 | EnumType ID {
+				 if (findID($2->getValue())) {
+
+											errorDef(yylineno, $2->getValue());
+											exit(0);
+										}
+						$2->type = $1->getType();
+						$$ = new FormalDeclData($1->getType(), $2->getValue(), $1->name); /* $1->name */
+				} /* Enum here */
+;
+
+/* Enum HERE */
+EnumeratorList : Enumerator {
+						$$ = new EnumsData();
+						$$->enumList.push_back($1); 
+				 }
+				 | EnumeratorList COMMA Enumerator {
+						$1->enumList.push_back($3);
+						$$ = $1;
+				 }
+;
+
+Enumerator : ID {
+					if (findID($1->getValue())) {
+						errorDef(yylineno, $1->getValue());
+						exit(0);
+					}
+					$$ = new TypeData(ENUMS, $1->getValue());
+					insertToStackTable($1, ENUMS);
+				}
+;
+
+Statements : Statement { $$ = $1; 		
+ }
+			 | Statements M Statement { 
+			 	CodeBuffer::instance().bpatch( $1->nextList, $2->quad );
+				$$ =  $3;
+			 }
+;
+
+Statement : statement_start {
+             $$ = $1;
+            }
+            | closed_statement {
+             $$ = $1;
+            }
+		    ;
+			
+OPENSCOPE : {
+	scopeBegin();
+};
+
+CLOSESCOPE : {
+	scopeEnd();
+};
+			
+statement_start : IF_STATE RPAREN OPENSCOPE M Statement { 
+							
+							$$ = new StatementData();
+	CodeBuffer::instance().bpatch($1->trueList , $4->quad );
+	CodeBuffer::instance().brToLabel();
+	string label = CodeBuffer::instance().genLabel();
+	scopeEnd();
+	CodeBuffer::instance().bpatch($5->nextList , label);
+	int loc = CodeBuffer::instance().emit("br label @");
+	$$->nextList = CodeBuffer::merge($1->falseList, CodeBuffer::makelist({loc, FIRST}));
+							// scopeEnd(); 
+							
+							}
+							
+			| IF_STATE RPAREN OPENSCOPE M closed_statement M CLOSESCOPE N ELSE OPENSCOPE M statement_start M CLOSESCOPE N {
+	$$ = new StatementData();
+	CodeBuffer::instance().bpatch($1->trueList, $4->quad );
+	CodeBuffer::instance().bpatch($1->falseList, $11->quad );
+	
+	CodeBuffer::instance().bpatch($5->nextList, $6->quad );
+	CodeBuffer::instance().bpatch($12->nextList, $13->quad );
+
+    $$->nextList = CodeBuffer::merge( $15->nextList, $8->nextList);
+			
+			} 
+	
+			| WHILE_STATE RPAREN OPENSCOPE M statement_start {
+						
+					$$ = new StatementData();
+					SymbolTable* sym = getSymbolTable("while");
+					
+									
+					CodeBuffer::instance().bpatch(sym->continueList , $1->loop_cond);
+					CodeBuffer::instance().bpatch($1->trueList , $4->quad );
+					
+					$$->nextList = CodeBuffer::merge( $1->falseList, sym->breakList ); 
+					
+					CodeBuffer::instance().brToLabel();
+					string label = CodeBuffer::instance().genLabel();
+				    scopeEnd();
+				    CodeBuffer::instance().bpatch($5->nextList ,label );
+                    CodeBuffer::instance().emit("br label %" + $1->loop_cond);
+				
+					scopeDelete(); 
+				}
+			;
+closed_statement : simple_statement {
+					$$ = $1;
+				}
+							
+			| IF_STATE RPAREN OPENSCOPE M closed_statement M CLOSESCOPE N ELSE OPENSCOPE M closed_statement M CLOSESCOPE N {
+	$$ = new StatementData();
+	CodeBuffer::instance().bpatch($1->trueList, $4->quad );
+	CodeBuffer::instance().bpatch($1->falseList, $11->quad );
+	
+	CodeBuffer::instance().bpatch($5->nextList, $6->quad );
+	CodeBuffer::instance().bpatch($12->nextList, $13->quad );
+
+    $$->nextList = CodeBuffer::merge( $15->nextList, $8->nextList);
+			
+			} 
+	
+			| WHILE_STATE RPAREN OPENSCOPE M closed_statement {
+						
+					$$ = new StatementData();
+					SymbolTable* sym = getSymbolTable("while");
+					
+									
+					CodeBuffer::instance().bpatch(sym->continueList , $1->loop_cond);
+					CodeBuffer::instance().bpatch($1->trueList , $4->quad );
+					
+					$$->nextList = CodeBuffer::merge( $1->falseList, sym->breakList ); 
+					CodeBuffer::instance().brToLabel();
+					string label = CodeBuffer::instance().genLabel();
+				    scopeEnd();
+				    CodeBuffer::instance().bpatch($5->nextList ,label );
+                    CodeBuffer::instance().emit("br label %" + $1->loop_cond);
+				
+					scopeDelete(); 
+				}
+			;
+			
+IF_STATE : IF LPAREN LineMarker Exp {
+								if ($4->getType() != BOOLS) {
+									errorMismatch(yylineno);
+									exit(0);        
+								}	
+								$$ = $4;
+							}
+			;
+
+WHILE_STATE : WHILE LPAREN LineMarker M Exp {
+	if($5->getType() != BOOLS){
+					errorMismatch(yylineno);
+					exit(0);
+				    }
+			whileCreate();
+			$$ = $5;
+			$$->loop_cond = $4->quad;
+};
+
+
+LineMarker : { curr_line = yylineno; }
+;
+
+simple_statement : LBRACE OPENSCOPE Statements RBRACE { 
+	CodeBuffer::instance().brToLabel();
+
+			string label = CodeBuffer::instance().genLabel();
+				scopeEnd();
+				CodeBuffer::instance().bpatch($3->nextList ,label );
+                    int loc = CodeBuffer::instance().emit("br label @");
+					$$ = new StatementData();
+					$$->nextList = CodeBuffer::makelist({loc, FIRST});
+			}
+			| Type ID SC {
+							TablesStack* fun_table = stack_table[stack_table.size() - 1];
+							if (findID($2->getValue())) {
+								errorDef(yylineno, $2->getValue());
+								exit(0);
+							}
+							insertToStackTable($2, $1->getType());
+							TablesStack* table_id = stack_table[stack_table.size() - 1];
+							string addr_in_stack = genReg();
+							string tmp = genReg();
+							string tmp1 = genReg();
+							CodeBuffer::instance().emit(tmp + " = load i32, i32* %local_counter");
+							CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %local_base, i32 0, i32 " + tmp);
+							string t2 = genReg();
+							if ($1->getType() == BOOLS) {
+							string t1 = genReg();
+							CodeBuffer::instance().emit(t1 + " = add i1 0, 0");
+							CodeBuffer::instance().emit(t2 + " = zext i1 " + t1 + " to i32");
+							}
+							if ($1->getType() == BYTES) {
+							string t1 = genReg();
+							CodeBuffer::instance().emit(t1 + " = add i8 0, 0");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							}
+							if ($1->getType() == INTS) {
+							
+							CodeBuffer::instance().emit(t2 + " = add i32 0, 0");
+							
+							}
+							CodeBuffer::instance().emit("store i32 "+t2+", i32* " + addr_in_stack);
+							CodeBuffer::instance().emit(tmp1 + " = add i32 1, " + tmp);
+							CodeBuffer::instance().emit("store i32 " + tmp1 + ", i32* %local_counter");
+							
+							$$ = new StatementData();
+			$$->nextList =  CodeBuffer::makelist({CodeBuffer::instance().emit("br label @"), FIRST});
+						
+						 }
+			| EnumType ID SC {
+								TablesStack* fun_table = stack_table[stack_table.size() - 1];
+								if (findID($2->getValue())) {
+									errorDef(yylineno, $2->getValue());
+									exit(0);
+								}
+								/* we have to do a function that checks declared enums, in case there are none found do errorUndefEnum */
+								insertEnumToStackTable($2, ENUMS_TYPE, $1->name);
+									TablesStack* table_id = stack_table[stack_table.size() - 1];
+							string addr_in_stack = genReg();
+
+							string tmp = genReg();
+							string tmp1 = genReg();
+							CodeBuffer::instance().emit(tmp + " = load i32, i32* %local_counter");
+							CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %local_base, i32 0, i32 " + tmp);
+							CodeBuffer::instance().emit("store i32 0, i32* " + addr_in_stack);
+							CodeBuffer::instance().emit(tmp1 + " = add i32 1, " + tmp);
+							CodeBuffer::instance().emit("store i32 " + tmp1 + ", i32* %local_counter");
+
+				
+							$$ = new StatementData();
+			$$->nextList =  CodeBuffer::makelist({CodeBuffer::instance().emit("br label @"), FIRST});
+						
+								
+							}
+			| EnumDecl { $$ = new StatementData();/*printProductionRule(24);*/ } /* possibly need to edit this */
+			| Type ID ASSIGN Exp SC {
+										if (findID($2->getValue())) {
+
+											errorDef(yylineno, $2->getValue());
+											exit(0);
+										}
+										if (!sameType($1->getType(), $4->getType())) {
+											errorMismatch(yylineno);
+											exit(0);
+										}
+										$2->type = $1->getType();
+										insertToStackTable($2, $1->getType());
+										
+						string exp_p = genReg();
+						vector<pair<int,BranchLabelIndex>> tempLoc;
+				if($4->type == BOOLS){
+
+					//CodeBuffer::instance().emit(exp_p + " = alloca i32");
+					//same line written twice !?!?
+					//CodeBuffer::instance().emit(exp_p + " = alloca i32");
+
+					//CodeBuffer::instance().brToLabel();
+				    string falseLoc = CodeBuffer::instance().genLabel();
+					//CodeBuffer::instance().emit("store i32 0, i32* " + exp_p);
+					int nextLocboolF = CodeBuffer::instance().emit("br label @");
+					//CodeBuffer::instance().brToLabel();
+					string trueLoc = CodeBuffer::instance().genLabel();
+					//CodeBuffer::instance().emit("store i32 1, i32* " + exp_p);
+					int nextLocboolT  = CodeBuffer::instance().emit("br label @");
+                    CodeBuffer::instance().bpatch($4->trueList,trueLoc);
+					CodeBuffer::instance().bpatch($4->falseList,falseLoc);
+				    tempLoc = CodeBuffer::merge(CodeBuffer::makelist({nextLocboolF,FIRST}),CodeBuffer::makelist({nextLocboolT,FIRST}));
+					string nextLocbool = CodeBuffer::instance().genLabel();
+                    CodeBuffer::instance().bpatch(tempLoc,nextLocbool);
+					string t1 = genReg();
+					CodeBuffer::instance().emit(t1+" = phi i1 [ 0, %"+falseLoc+"], [ 1, %"+trueLoc+" ]");
+					CodeBuffer::instance().emit(exp_p + " = zext i1 " + t1 + " to i32");
+			  } else {
+				  exp_p = $4->place; // exp_p is a register and we need to load its value 
+		//		  CodeBuffer::instance().emit("store i32 "+$4->place+", i32* " + exp_p);
+			  }
+			  
+			  
+			  
+			  					
+					string addr_in_stack = genReg();
+
+							string tmp = genReg();
+							CodeBuffer::instance().emit(tmp + " = load i32, i32* %local_counter");
+							
+						SymbolTable* sym = getSymbolTable($2->getValue());
+              			int ptr = (sym->offset);//* 4;
+			            std::stringstream temp;
+						
+	             		if (sym->offset < 0) {
+				            temp << ((ptr*(-1)) - 1);                             // ** TODO update size of args stack ** //
+							if (sym->type == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							exp_p = t2;
+						}
+						if (sym->type == BOOLS) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i1");
+							CodeBuffer::instance().emit(t2 + " = zext i1 " + t1 + " to i32");
+							exp_p = t2;
+						}
+		               		CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %arg_base, i32 0, i32 " + temp.str());
+							CodeBuffer::instance().emit("store i32 " + exp_p + ", i32* " + addr_in_stack);
+		             	} else {
+				            temp << ptr;
+						if (sym->type == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							exp_p = t2;
+						}
+						if (sym->type == BOOLS) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i1");
+							CodeBuffer::instance().emit(t2 + " = zext i1 " + t1 + " to i32");
+							exp_p = t2;
+						}
+				            CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %local_base, i32 0, i32 " + temp.str());
+							CodeBuffer::instance().emit("store i32 " + exp_p + ", i32* " + addr_in_stack);
+			            }
+
+					//if($4->type != BOOLS){
+					/*	if ($1->getType() == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							exp_p = t2;
+						}
+							CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %local_base, i32 0, i32 " + tmp);
+							CodeBuffer::instance().emit("store i32 " + exp_p + ", i32* " + addr_in_stack);*/
+					//}
+					/*else {
+						//string exp_temp = genReg();
+						//CodeBuffer::instance().emit(exp_temp + " = load i32, i32* " +exp_p);
+						CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %local_base, i32 0, i32 " + tmp);
+							CodeBuffer::instance().emit("store i32 " + exp_p + ", i32* " + addr_in_stack);
+						
+					}*/
+							
+						string tmp1 = genReg();
+						CodeBuffer::instance().emit(tmp1 + " = add i32 1, " + tmp);
+						CodeBuffer::instance().emit("store i32 " + tmp1 + ", i32* %local_counter");
+	
+
+							
+							$$ = new StatementData();
+			$$->nextList =  CodeBuffer::makelist({CodeBuffer::instance().emit("br label @"), FIRST});
+							
+									}
+			| EnumType ID ASSIGN Exp SC {
+										if (findID($2->getValue())) {
+											errorDef(yylineno, $2->getValue());
+											exit(0);
+										}
+										
+										if (!sameTypeEnums($1->getType(), $4->getType())) {
+											errorUndefEnumValue(yylineno, $2->getValue());
+											exit(0);
+										}
+										if (!isInList($1->name, $4->name) && $4->getType() == ENUMS) { /* isInList implementation !! */  
+											errorUndefEnumValue(yylineno, $2->getValue()); /* <<<<--- Also check all error functions with 2 arguments */ 
+											exit(0);
+										}
+										$2->type = ENUMS_TYPE;
+										insertEnumToStackTable($2, ENUMS_TYPE, $1->name);
+										string exp_p = genReg();
+										
+				  exp_p = $4->place;
+			  	TablesStack* table_id = stack_table[stack_table.size() - 1];
+							
+							string addr_in_stack = genReg(); 
+							
+							
+							string tmp = genReg();
+							string tmp1 = genReg();
+							CodeBuffer::instance().emit(tmp + " = load i32, i32* %local_counter");
+							CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %local_base, i32 0, i32 " + tmp);
+							CodeBuffer::instance().emit("store i32 " + exp_p + ", i32* " + addr_in_stack);
+							CodeBuffer::instance().emit(tmp1 + " = add i32 1, " + tmp);
+							CodeBuffer::instance().emit("store i32 " + tmp1 + ", i32* %local_counter");
+							
+
+							$$ = new StatementData();
+			$$->nextList =  CodeBuffer::makelist({CodeBuffer::instance().emit("br label @"), FIRST});
+							
+			}
+			| ID ASSIGN Exp SC {
+									if (findID($1->getValue()) == false) {
+										errorUndef(yylineno, $1->getValue());
+										exit(0);
+									}
+									
+									SymbolTable* sym = getSymbolTable($1->getValue());
+									if (findID($1->getValue()) == true && sym->is_fun == true) {
+										errorUndef(yylineno, $1->getValue());
+										exit(0);
+									}
+										// Just check whether the two enum sides are the same enums ...
+									if (sym->type == ENUMS_TYPE) {
+										if (!sameTypeEnums(sym->type, $3->getType())) {
+											errorUndefEnumValue(yylineno, $1->getValue()); 
+											exit(0);
+										}
+										if (!isInList(sym->enum_id, $3->name) && $3->getType() == ENUMS) {
+											errorUndefEnumValue(yylineno, $1->getValue());
+											exit(0);
+										}
+									} else {
+									if (!sameType(sym->type, $3->getType()) && !(sym->type == INTS && $3->getType() == BYTES)) {
+										errorMismatch(yylineno);
+										exit(0);
+									}
+									}
+						string exp_p = genReg();
+						vector<pair<int,BranchLabelIndex>> tempLoc;
+				if($3->type == BOOLS){
+				    string falseLoc = CodeBuffer::instance().genLabel();
+					int nextLocboolF = CodeBuffer::instance().emit("br label @");
+					string trueLoc = CodeBuffer::instance().genLabel();
+					int nextLocboolT  = CodeBuffer::instance().emit("br label @");
+                    CodeBuffer::instance().bpatch($3->trueList,trueLoc);
+					CodeBuffer::instance().bpatch($3->falseList,falseLoc);
+				    tempLoc = CodeBuffer::merge(CodeBuffer::makelist({nextLocboolF,FIRST}),CodeBuffer::makelist({nextLocboolT,FIRST}));
+					string nextLocbool = CodeBuffer::instance().genLabel();
+                    CodeBuffer::instance().bpatch(tempLoc,nextLocbool);
+					string t1 = genReg();
+					CodeBuffer::instance().emit(t1+" = phi i1 [ 0, %"+falseLoc+"], [ 1, %"+trueLoc+" ]");
+					CodeBuffer::instance().emit(exp_p + " = zext i1 " + t1 + " to i32");
+			  } else {						
+			        	exp_p = $3->place;
+			  }						
+		             	TablesStack* table_id = stack_table[stack_table.size() - 1];
+				
+	               		string addr_in_stack = genReg();
+              			int ptr = (sym->offset);//* 4;
+			            std::stringstream temp;
+						
+	             		if (sym->offset < 0) {
+				            temp << ((ptr*(-1)) - 1);                             // ** TODO update size of args stack ** //
+							if (sym->type == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							exp_p = t2;
+						}
+						if (sym->type == BOOLS) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i1");
+							CodeBuffer::instance().emit(t2 + " = zext i1 " + t1 + " to i32");
+							exp_p = t2;
+						}
+		               		CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %arg_base, i32 0, i32 " + temp.str());
+							CodeBuffer::instance().emit("store i32 " + exp_p + ", i32* " + addr_in_stack);
+		             	} else {
+				            temp << ptr;
+						if (sym->type == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							exp_p = t2;
+						}
+						if (sym->type == BOOLS) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + exp_p + " to i1");
+							CodeBuffer::instance().emit(t2 + " = zext i1 " + t1 + " to i32");
+							exp_p = t2;
+						}
+				            CodeBuffer::instance().emit(addr_in_stack + " = getelementptr [50 x i32], [50 x i32]* %local_base, i32 0, i32 " + temp.str());
+							CodeBuffer::instance().emit("store i32 " + exp_p + ", i32* " + addr_in_stack);
+			            }
+						$$ = new StatementData();
+		            	$$->nextList =  CodeBuffer::makelist({CodeBuffer::instance().emit("br label @"), FIRST});
+									
+				   }
+			| Call SC { 
+			    $$ = new StatementData();
+			$$->nextList =  CodeBuffer::makelist({CodeBuffer::instance().emit("br label @"), FIRST});  
+			} 
+			
+			| RETURN SC {
+							TablesStack* fun_table = stack_table[0];
+							SymbolTable* sym = fun_table->tables.back();
+							if (sym->type != VOIDS) {
+								errorMismatch(yylineno);
+								exit(0);
+							}
+		     	$$ = new StatementData();
+				
+                CodeBuffer::instance().emit("br label %ret_void");
+							
+						}
+			| RETURN Exp SC {
+								TablesStack* fun_table = stack_table[0];
+								SymbolTable* sym = fun_table->tables.back();
+								if (sym->type == VOIDS || !sameType(sym->type, $2->getType())) {
+									errorMismatch(yylineno);
+									exit(0);
+								}
+								
+			$$ = new StatementData();
+			 string exp_p = genReg();
+			 vector<pair<int, BranchLabelIndex>> tempLoc;
+                if($2->type == BOOLS){
+					//CodeBuffer::instance().emit(exp_p + " = alloca i32");
+
+					CodeBuffer::instance().brToLabel();
+                    string falseLoc = CodeBuffer::instance().genLabel();
+		            //CodeBuffer::instance().emit("store i32 0, i32* " + exp_p);
+					int nextLocboolF  = CodeBuffer::instance().emit("br label @");
+					//CodeBuffer::instance().brToLabel();
+					string trueLoc = CodeBuffer::instance().genLabel();
+		           // CodeBuffer::instance().emit("store i32 1, i32* " + exp_p);
+					int nextLocboolT  = CodeBuffer::instance().emit("br label @");
+                    CodeBuffer::instance().bpatch($2->trueList,trueLoc);
+					CodeBuffer::instance().bpatch($2->falseList,falseLoc);
+				    tempLoc = CodeBuffer::merge(CodeBuffer::makelist({nextLocboolF, FIRST}),CodeBuffer::makelist({nextLocboolT,FIRST}));
+                   // CodeBuffer::instance().brToLabel();
+					string nextLocbool = CodeBuffer::instance().genLabel();
+                    CodeBuffer::instance().bpatch(tempLoc,nextLocbool);
+					string t1 = genReg();
+					CodeBuffer::instance().emit(t1+" = phi i1 [ 0, %"+falseLoc+"], [ 1, %"+trueLoc+" ]");
+					CodeBuffer::instance().emit(exp_p + " = zext i1 " + t1 + " to i32");
+			    }else{
+                   exp_p = $2->place;
+				}
+				
+				if($2->type == BOOLS){
+					//string exp_temp = genReg();
+                   // CodeBuffer::instance().emit(exp_temp + " = load i32, i32* " +exp_p);
+				   
+                    CodeBuffer::instance().emit("ret i32 " + exp_p);
+
+				}
+				
+				else {
+				CodeBuffer::instance().emit("ret i32 " + exp_p);
+
+				}
+				}
+			| BREAK SC {
+							if (!isLoop()) {
+								errorUnexpectedBreak(yylineno);
+								exit(0);
+							}
+							
+				$$ = new StatementData();              
+		
+				SymbolTable* sym = getSymbolTable("while");
+			    int loc = CodeBuffer::instance().emit("br label @");
+			    sym->breakList = CodeBuffer::merge(sym->breakList ,CodeBuffer::makelist({loc,FIRST}));
+	
+		 					
+					   }
+			| CONTINUE SC {
+								if(!isLoop()) {
+									errorUnexpectedContinue(yylineno);
+									exit(0);
+								}
+								
+				$$ = new StatementData();              
+										
+				SymbolTable* sym = getSymbolTable("while");
+			    int loc = CodeBuffer::instance().emit("br label @");
+			    sym->continueList = CodeBuffer::merge(sym->continueList ,CodeBuffer::makelist({loc,FIRST}));				
+								
+				}
+;
+
+Call : ID LPAREN ExpList RPAREN { // f(x,y,z,w)
+			if (!findID($1->getValue())) {
+				errorUndefFunc(yylineno, $1->getValue());
+				exit(0);
+		    }
+			SymbolTable* f_sym = getSymbolTable($1->getValue());
+			if(f_sym->is_fun == false) {
+				errorUndefFunc(yylineno, $1->getValue());
+				exit(0);
+			}
+			vector<string> params;
+	        fromTypeToString(f_sym, f_sym->fun_param_types, params);
+
+			if ($3->expList.size() != f_sym->fun_param_types.size()) {
+				errorPrototypeMismatch(yylineno, $1->getValue(), params);
+			    exit(0);
+			}
+			for (int i = 0; i < $3->expList.size(); i++) {
+				if (f_sym->fun_param_types[i] == ENUMS_TYPE) {
+										if (!sameTypeEnums(f_sym->fun_param_types[i], $3->expList[i]->getType())) {
+											errorPrototypeMismatch(yylineno, $1->getValue(), params); 
+											exit(0);
+										} // CHECK THIS SITUATION
+										if (($3->expList[i]->getType() == ENUMS_TYPE) && (f_sym->enum_params[i] != getEnumID($3->expList[i]->name))) {
+											errorPrototypeMismatch(yylineno, $1->getValue(), params); 
+											exit(0);
+										}
+										if (($3->expList[i]->getType() == ENUMS)&& (!isInList(f_sym->enum_params[i], $3->expList[i]->name))) {
+											errorPrototypeMismatch(yylineno, $1->getValue(), params);
+											exit(0);
+										}
+									} else {
+				if (!sameType(f_sym->fun_param_types[i], $3->expList[i]->getType())) {
+					errorPrototypeMismatch(yylineno, $1->getValue(), params);
+					exit(0);
+				}
+									}
+			}
+			
+		$$ = new ExpData(f_sym->type);
+		string tmp = genReg();
+		if ($1->getValue() == "print") {
+			CodeBuffer::instance().emit("call void @print(i8* " + $3->expList[0]->place + ")");
+		}
+		else {
+		if (f_sym->type == VOIDS)
+			CodeBuffer::instance().emit("call void @" + $1->getValue() + "(");
+		else	
+			CodeBuffer::instance().emit(tmp + " = call i32 @" + $1->getValue() + "(");
+		
+		for (int i = $3->expList.size() - 1; i >= 0; i--) {
+			if (i == 0)
+				CodeBuffer::instance().emit("i32 " + $3->expList[i]->place + ")");
+			else
+				CodeBuffer::instance().emit("i32 " + $3->expList[i]->place + ", ");
+		}
+		}
+		$$->place = tmp;
+		}
+		
+		
+	   | ID LPAREN RPAREN {
+		   if (!findID($1->getValue())) {
+			errorUndefFunc(yylineno, $1->getValue());
+			exit(0);
+		}
+
+		SymbolTable* sym = getSymbolTable($1->getValue());
+		if(sym->is_fun == false) {
+			errorUndefFunc(yylineno, $1->getValue());
+			exit(0);
+		}
+		if (sym && sym->fun_param_types.size() != 0) {
+			errorMismatch(yylineno);
+		    exit(0);
+		}
+			
+		string tmp = genReg();
+		$$ = new ExpData(sym->type); 
+		if (sym->type == VOIDS)
+			CodeBuffer::instance().emit("call void @" + $1->getValue() + "()");
+		else	
+			CodeBuffer::instance().emit(tmp + " = call i32 @" + $1->getValue() + "()");
+		$$->place = tmp;
+		
+	}
+;
+
+ExpList : Exp { $$ = new ExpListData();
+				$$->expList.push_back($1);
+				
+				
+				if($1->type == BOOLS){
+					vector<pair<int, BranchLabelIndex>> tempLoc;
+					string exp_p = genReg();
+					//CodeBuffer::instance().emit(exp_p + " = alloca i32");
+					CodeBuffer::instance().brToLabel();
+					string falseLoc = CodeBuffer::instance().genLabel();
+		            //CodeBuffer::instance().emit("store i32 0, i32* " + exp_p);
+					int nextLocboolF  = CodeBuffer::instance().emit("br label @");
+					//CodeBuffer::instance().brToLabel();
+					string trueLoc = CodeBuffer::instance().genLabel();
+		           // CodeBuffer::instance().emit("store i32 1, i32* " + exp_p);
+					int nextLocboolT  = CodeBuffer::instance().emit("br label @");
+                    CodeBuffer::instance().bpatch($1->trueList,trueLoc);
+					CodeBuffer::instance().bpatch($1->falseList,falseLoc);
+				    tempLoc = CodeBuffer::merge(CodeBuffer::makelist({nextLocboolF,FIRST}),CodeBuffer::makelist({nextLocboolT,FIRST}));
+                   	//CodeBuffer::instance().brToLabel();
+					string nextLocbool = CodeBuffer::instance().genLabel();
+                    CodeBuffer::instance().bpatch(tempLoc,nextLocbool);
+					string t1 = genReg();
+					CodeBuffer::instance().emit(t1+" = phi i1 [ 0, %"+falseLoc+"], [ 1, %"+trueLoc+" ]");
+					CodeBuffer::instance().emit(exp_p + " = zext i1 " + t1 + " to i32");
+					
+					//string exp_temp = genReg();
+					//CodeBuffer::instance().emit(exp_temp + " = load i32, i32* " +exp_p);
+					
+					$1->place = exp_p;
+					
+				}
+			  }
+		  | ExpMarker ExpList {
+				$2->expList.push_back($1);
+				$$ = $2; 
+			}
+;
+ExpMarker : Exp COMMA {
+	
+	          $$ = $1;
+				if($1->type == BOOLS){
+					
+					vector<pair<int, BranchLabelIndex>> tempLoc;
+					string exp_p = genReg();
+					//CodeBuffer::instance().emit(exp_p + " = alloca i32");
+						CodeBuffer::instance().brToLabel();
+					string falseLoc = CodeBuffer::instance().genLabel();
+		           // CodeBuffer::instance().emit("store i32 0, i32* " + exp_p);
+					int nextLocboolF  = CodeBuffer::instance().emit("br label @");
+					//CodeBuffer::instance().brToLabel();
+					string trueLoc = CodeBuffer::instance().genLabel();
+					//CodeBuffer::instance().emit("store i32 1, i32* " + exp_p);
+					int nextLocboolT  = CodeBuffer::instance().emit("br label @");
+                    CodeBuffer::instance().bpatch($1->trueList,trueLoc);
+					CodeBuffer::instance().bpatch($1->falseList,falseLoc);
+				    tempLoc = CodeBuffer::merge(CodeBuffer::makelist({nextLocboolF,FIRST}),CodeBuffer::makelist({nextLocboolT,FIRST}));
+                    //CodeBuffer::instance().brToLabel();
+					string nextLocbool = CodeBuffer::instance().genLabel();
+                    CodeBuffer::instance().bpatch(tempLoc,nextLocbool);
+					string t1 = genReg();
+					CodeBuffer::instance().emit(t1+" = phi i1 [ 0, %"+falseLoc+"], [ 1, %"+trueLoc+" ]");
+					CodeBuffer::instance().emit(exp_p + " = zext i1 " + t1 + " to i32");
+					
+					//string exp_temp = genReg();
+                    //CodeBuffer::instance().emit(exp_temp + " = load i32, i32* " +exp_p);
+					
+                    $1->place = exp_p;
+					
+				}
+}
+;
+
+Type : INT { $$ = new TypeData(INTS); }
+	   | BYTE { $$ = new TypeData(BYTES); }
+	   | BOOL { $$ = new TypeData(BOOLS); }
+;
+
+/* deal with Enum later */
+EnumType : ENUM ID { 
+							if (!findID($2->getValue())) {
+								errorUndefEnum(yylineno, $2->getValue());
+								exit(0);
+							}
+				$$ = new FormalDeclData(ENUMS_TYPE, $2->getValue()); 
+				}
+;
+
+Exp : LPAREN Exp RPAREN { $$ = $2; }
+	  | Exp BINOPADD Exp {
+			if (!isNumber($1->getType()) || !isNumber($3->getType())) {
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			if ($1->getType() == INTS || $3->getType() == INTS) {
+				$$ = new ExpData(INTS);
+			} else {
+				$$ = new ExpData(BYTES); 
+			}
+			
+			string exp1 = $1->place;
+			string exp2 = $3->place;
+			string binop = $2->getValue();
+			
+			$$->place = genReg();
+			if (binop == "+") {
+				/*if ($$->getType() == BYTES) {
+					string tmp = genReg();
+					CodeBuffer::instance().emit(tmp + " = add i8 " + exp1 + ", " + exp2);
+					CodeBuffer::instance().emit($$->place + " = zext i8 " + tmp + " to i32");
+				} else*/	
+					CodeBuffer::instance().emit($$->place + " = add i32 " + exp1 + ", " + exp2);
+					if ($$->getType() == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + $$->place + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							$$->place = t2;
+					}
+			}
+			if (binop == "-") {
+				/*if ($$->getType() == BYTES) {
+					string tmp = genReg();
+					CodeBuffer::instance().emit(tmp + " = sub i8 " + exp1 + ", " + exp2);
+					CodeBuffer::instance().emit($$->place + " = zext i8 " + tmp + " to i32");
+				} else	*/
+					CodeBuffer::instance().emit($$->place + " = sub i32 " + exp1 + ", " + exp2);
+					if ($$->getType() == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + $$->place + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							$$->place = t2;
+					}
+			}
+				
+	  }
+	  | Exp BINOPMUL Exp {
+				if (!isNumber($1->getType()) || !isNumber($3->getType())) {
+					errorMismatch(yylineno);
+					exit(0);
+				}
+				if ($1->getType() == INTS || $3->getType() == INTS) {
+					$$ = new ExpData(INTS);
+				} else {
+					$$ = new ExpData(BYTES); 
+				}
+				
+			string exp1 = $1->place;
+			string exp2 = $3->place;
+			string binop = $2->getValue();
+			string cond = genReg();
+			
+			$$->place = genReg();
+			if (binop == "*") {
+				/*if ($$->getType() == BYTES) {
+					string tmp = genReg();
+					CodeBuffer::instance().emit(tmp + " = mul i8 " + exp1 + ", " + exp2);
+					CodeBuffer::instance().emit($$->place + " = zext i8 " + tmp + " to i32");
+				} else*/	
+					CodeBuffer::instance().emit($$->place + " = mul i32 " + exp1 + ", " + exp2);
+					if ($$->getType() == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + $$->place + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							$$->place = t2;
+					}
+			}
+			
+			if (binop == "/") {
+				
+				////////// continue this division
+				CodeBuffer::instance().emit(cond + " = icmp eq i32 0, " + exp2);
+				int address = CodeBuffer::instance().emit("br i1 " + cond + ", label @, label @"); 
+				/////// division by zero 
+				
+				string zeroLabel=CodeBuffer::instance().genLabel();
+			
+			CodeBuffer::instance().emit("call void @print(i8* getelementptr ([23 x i8], [23 x i8]* @.divzero, i32 0, i32 0))");
+			CodeBuffer::instance().emit("call void @exit(i32 1)");
+	
+			CodeBuffer::instance().brToLabel();
+			string notZeroLabel=CodeBuffer::instance().genLabel();
+				
+				/*if ($$->getType() == BYTES) { // check division by zero 
+					string tmp = genReg();
+					CodeBuffer::instance().emit(tmp + " = sdiv i8 " + exp1 + ", " + exp2);
+					CodeBuffer::instance().emit($$->place + " = zext i8 " + tmp + " to i32");
+				} else	*/
+					CodeBuffer::instance().emit($$->place + " = sdiv i32 " + exp1 + ", " + exp2);
+					if ($$->getType() == BYTES) {
+							string t1 = genReg();
+							string t2 = genReg();
+							CodeBuffer::instance().emit(t1 + " = trunc i32 " + $$->place + " to i8");
+							CodeBuffer::instance().emit(t2 + " = zext i8 " + t1 + " to i32");
+							$$->place = t2;
+					}
+			 
+			
+			CodeBuffer::instance().bpatch(CodeBuffer::makelist({address, FIRST}),zeroLabel);
+			CodeBuffer::instance().bpatch(CodeBuffer::makelist({address, SECOND}),notZeroLabel);
+			}
+		
+		
+			
+			
+	  }
+	  | ID { // z = x;	  
+
+			if (findID($1->getValue()) == false) {
+
+				errorUndef(yylineno, $1->getValue());
+				exit(0);
+			}
+
+				for (int i = 0; i < enums_list.size(); i++) {
+					if (enums_list[i]->name == $1->getValue()) {
+						errorUndef(yylineno, $1->getValue());
+						exit(0);
+					}
+				}
+			//
+			SymbolTable* sym = getSymbolTable($1->getValue());
+			TablesStack* table_id = stack_table[stack_table.size() - 1];
+			
+			$$ = new ExpData(sym->type, $1->getValue());
+			$$->place = genReg();
+			string addr = genReg();
+			int ptr = (sym->offset);// * 4;
+			std::stringstream temp;
+		
+			if (sym->offset < 0) {
+				temp << ((ptr*(-1)) - 1);                              // **  TODO update size of arg stack ** //
+				CodeBuffer::instance().emit(addr + " = getelementptr [50 x i32], [50 x i32]* %arg_base, i32 0, i32 " + temp.str());
+				if (sym->type == ENUMS) {
+					stringstream s;
+					int serial = getSerialEnum($1->getValue());
+					s << serial;
+					CodeBuffer::instance().emit($$->place + " = add i32 0, " + s.str());
+				} else
+					CodeBuffer::instance().emit($$->place + " = load i32, i32* " + addr);
+			} else {
+				temp << ptr;
+				CodeBuffer::instance().emit(addr + " = getelementptr [50 x i32], [50 x i32]* %local_base, i32 0, i32 " + temp.str());
+				if (sym->type == ENUMS) {
+					stringstream s;
+					int serial = getSerialEnum($1->getValue());
+					s << serial;
+					CodeBuffer::instance().emit($$->place + " = add i32 0, " + s.str());
+				} else
+					CodeBuffer::instance().emit($$->place + " = load i32, i32* " + addr);
+			}
+			if (sym->type == BOOLS) {
+				string cond1 = genReg();
+				string t2 = genReg();
+			
+				CodeBuffer::instance().emit(t2 + " = trunc i32 " + $$->place + " to i1");
+				CodeBuffer::instance().emit(cond1 + " = icmp eq i1 0, " + t2);
+				int condAddress = CodeBuffer::instance().emit("br i1 " + cond1 + ", label @, label @");
+				$$->falseList = CodeBuffer::makelist({condAddress,FIRST});
+				$$->trueList  = CodeBuffer::makelist({condAddress,SECOND});
+			
+			}
+	
+		
+	  }
+	  | Call { 
+		$$ = $1;
+		if($$->type == BOOLS){
+					
+				string cond1 = genReg();
+				string t2 = genReg();
+			
+				CodeBuffer::instance().emit(t2 + " = trunc i32 " + $$->place + " to i1");
+				CodeBuffer::instance().emit(cond1 + " = icmp eq i1 1, " + t2);
+				int condAddress = CodeBuffer::instance().emit("br i1 " + cond1 + ", label @, label @");
+				
+				$$->falseList = CodeBuffer::makelist({condAddress,SECOND});
+				$$->trueList  = CodeBuffer::makelist({condAddress,FIRST});
+				}
+		}
+	  | NUM {
+			int number = atoi(($1->getValue()).c_str());
+			$$ = new ExpData(INTS);
+			$$->place = genReg(); // %var0
+			stringstream temp;
+			temp << number;
+			CodeBuffer::instance().emit($$->place + " = add i32 0, " + temp.str());
+	  }
+	  | NUM_B {
+			int number = atoi(($1->getValue()).c_str());
+			if (number > 255) {
+				errorByteTooLarge(yylineno, $1->getValue());
+				exit(0);
+			}
+			$$ = new ExpData(BYTES);
+			$$->place = genReg(); // %var0
+			stringstream temp;
+			temp << number;
+			string tmp = genReg();
+			CodeBuffer::instance().emit(tmp + " = add i8 0, " + temp.str());
+			CodeBuffer::instance().emit($$->place + " = zext i8 " + tmp + " to i32");
+	  }
+	  | STRING { $$ = new ExpData(STRINGS); 
+		$$->place = genReg();
+		string str = $1->getValue();
+		str.erase(0, 1);
+		str.erase(str.size()-1, str.size()-1);
+		int len1 = str.size() + 1;
+		stringstream len;
+		len << len1;
+		string glabel = GLabel::Init()->genGLabel();
+		string str_var = "@." + glabel + "str";
+		//CodeBuffer::instance().emitGlobal(glabel + ": ");
+		CodeBuffer::instance().emitGlobal(str_var + " = internal constant [" + len.str() + " x i8] c\"" + str + "\\00\"");
+		CodeBuffer::instance().emit($$->place + " = getelementptr [" + len.str() + " x i8], [" + len.str() + " x i8]* " + str_var + ", i32 0, i32 0");
+	  
+	  }
+	  | TRUE { $$ = new ExpData(BOOLS); 
+	  $$->place=genReg();
+	  string tmp = genReg();
+		CodeBuffer::instance().emit(tmp + " = add i1 0, 1");
+		CodeBuffer::instance().emit($$->place + " = zext i1 " + tmp + " to i32");
+		
+	         int location = CodeBuffer::instance().emit("br label @");
+	         $$->trueList = CodeBuffer::makelist({location,FIRST});
+	  }
+	  | FALSE { $$ = new ExpData(BOOLS);
+	    $$->place=genReg();
+	  string tmp = genReg();
+		CodeBuffer::instance().emit(tmp + " = add i1 0, 0");
+		CodeBuffer::instance().emit($$->place + " = zext i1 " + tmp + " to i32");
+	          int location = CodeBuffer::instance().emit("br label @");
+	          $$->falseList = CodeBuffer::makelist({location,FIRST}); 
+	  }
+	  | NOT Exp {
+		  	if($2->getType() != BOOLS){
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			$$ = new ExpData(BOOLS);//$2;  // why fesh new ?
+			$$->trueList  = $2->falseList;
+            $$->falseList = $2->trueList;
+			$$->place = $2->place;
+			//string cond = genReg();
+			
+			/*CodeBuffer::instance().emit(cond + " = icmp eq i32 " + $2->place + ", 0");
+			int condAddress = CodeBuffer::instance().emit("br i1 " + cond + ", label @, label @");
+			string cond_yes=CodeBuffer::instance().genLabel();
+			CodeBuffer::instance().brToLabel();
+			string cond_no=CodeBuffer::instance().genLabel();
+			CodeBuffer::instance().bpatch(CodeBuffer::makelist({condAddress, FIRST}),cond_yes);
+			CodeBuffer::instance().bpatch(CodeBuffer::makelist({condAddress, SECOND}),cond_no);
+			CodeBuffer::instance().emit($$->place+" = phi i32 [ 1, %"+cond_yes+"], [ 0, %"+cond_no+" ]");*/
+			
+			
+	  }
+	  | Exp AND M Exp {
+				if ($1->getType() != $4->getType()) {
+					errorMismatch(yylineno);
+					exit(0);
+				}
+				if ($1->getType() != BOOLS) {
+					errorMismatch(yylineno);
+					exit(0);
+				}		
+				$$ = new ExpData(BOOLS);
+				
+		CodeBuffer::instance().bpatch( $1->trueList , $3->quad );//backpatch(B1.trueList, M.instr);
+		$$->trueList = $4->trueList;     // B.trueList = B2.trueList;
+		$$->falseList = CodeBuffer::merge( $1->falseList , $4->falseList ); //B.falseList = B1.falseList + B2.falseList
+	
+	  }
+	  | Exp OR M Exp {
+			if ($1->getType() != BOOLS || $4->getType() != BOOLS) {
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			$$ = new ExpData(BOOLS);
+		CodeBuffer::instance().bpatch( $1->falseList , $3->quad );// backpatch(B1.falseList, M.instr);
+		$$->trueList = CodeBuffer::merge( $1->trueList , $4->trueList ); // B.trueList = B1.trueList + B2.trueList;
+		$$->falseList = $4->falseList;     // B.falseList = B2.falseList;
+
+	  }
+	  | Exp EQUALITY Exp { 
+			if (!isNumber($1->getType()) || !isNumber($3->getType())) {
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			$$ = new ExpData(BOOLS);
+		string exp1 = $1->place;
+        string exp2 = $3->place;
+        string op  = $2->getValue();
+		string cond = genReg();
+		if (op == "==" ){
+		
+			CodeBuffer::instance().emit(cond + " = icmp eq i32 " + exp1 + ", " + exp2);
+			int condAddress = CodeBuffer::instance().emit("br i1 " + cond + ", label @, label @");
+			$$->falseList = CodeBuffer::makelist({condAddress,SECOND});
+			$$->trueList  = CodeBuffer::makelist({condAddress,FIRST});
+		}
+		if (op == "!=" ){
+		
+			CodeBuffer::instance().emit(cond + " = icmp ne i32 " + exp1 + ", " + exp2);
+			int condAddress = CodeBuffer::instance().emit("br i1 " + cond + ", label @, label @");
+			$$->falseList = CodeBuffer::makelist({condAddress,SECOND});
+			$$->trueList  = CodeBuffer::makelist({condAddress,FIRST});
+		}
+				
+	  }
+	  | Exp RELATION Exp {
+			if (!isNumber($1->getType()) || !isNumber($3->getType())) {
+				errorMismatch(yylineno);
+				exit(0);
+			}
+			$$ = new ExpData(BOOLS);
+		string exp1 = $1->place;
+        string exp2 = $3->place;
+        string op  = $2->getValue();
+		string cond = genReg();
+		if (op == ">" ){
+		
+			CodeBuffer::instance().emit(cond + " = icmp sgt i32 " + exp1 + ", " + exp2);
+			int condAddress = CodeBuffer::instance().emit("br i1 " + cond + ", label @, label @");
+			$$->falseList = CodeBuffer::makelist({condAddress,SECOND});
+			$$->trueList  = CodeBuffer::makelist({condAddress,FIRST});
+		}
+		if (op == "<" ){
+		
+			CodeBuffer::instance().emit(cond + " = icmp slt i32 " + exp1 + ", " + exp2);
+			int condAddress = CodeBuffer::instance().emit("br i1 " + cond + ", label @, label @");
+			$$->falseList = CodeBuffer::makelist({condAddress,SECOND});
+			$$->trueList  = CodeBuffer::makelist({condAddress,FIRST});
+		}
+		if (op == ">=" ){
+		
+			CodeBuffer::instance().emit(cond + " = icmp sge i32 " + exp1 + ", " + exp2);
+			int condAddress = CodeBuffer::instance().emit("br i1 " + cond + ", label @, label @");
+			$$->falseList = CodeBuffer::makelist({condAddress,SECOND});
+			$$->trueList  = CodeBuffer::makelist({condAddress,FIRST});
+		}
+		if (op == "<=" ){
+		
+			CodeBuffer::instance().emit(cond + " = icmp sle i32 " + exp1 + ", " + exp2);
+			int condAddress = CodeBuffer::instance().emit("br i1 " + cond + ", label @, label @");
+			$$->falseList = CodeBuffer::makelist({condAddress,SECOND});
+			$$->trueList  = CodeBuffer::makelist({condAddress,FIRST});
+		}
+			
+			
+	  }
+	  | LPAREN Type RPAREN Exp { // (int)SUNDAY
+		  if (!($2->getType() == INTS && ($4->getType() == ENUMS_TYPE || $4->getType() == ENUMS))) { // Enum day x = SUN; int z = (int)x;
+				errorMismatch(yylineno);
+				exit(0);
+		  }
+		  $$ = new ExpData(INTS);
+		  $$->place = $4->place;
+
+	  }
+	  /* deal with casting later */ 
+;
+
+
+M : {
+
+    $$ = new M_Data();
+	CodeBuffer::instance().brToLabel();
+	$$->quad = CodeBuffer::instance().genLabel();
+	string stam_reg = genReg();
+    CodeBuffer::instance().emit(stam_reg + " = add i32 0, 1");
+}
+
+N : {
+    $$ = new StatementData();
+	int loc = CodeBuffer::instance().emit("br label @"); 
+	$$->nextList = CodeBuffer::makelist({loc, FIRST});
+	//CodeBuffer::instance().bpatch($$->nextList, CodeBuffer::instance().genLabel());
+}	
+
+%%
+
+void yyerror(char const*) {
+	errorSyn(yylineno);
+}
+
+int main() {
+	return yyparse();
+}
+
+SymbolTable* getSymbolTable(const string& value) {
+	int index = stack_table.size() - 1;
+	while (index >= 0) {
+		TablesStack* table_id = stack_table[index];
+		for (int i = 0; i < table_id->tables.size(); i++) {
+			if (table_id->tables[i]->name == value) {
+				return table_id->tables[i];
+			}
+		}
+		index--;
+	}
+	return NULL;
+}
+
+int isNumber(Types type) {
+	// add enum type possibly ?!
+    return (type == INTS || type == BYTES);	
+}
+
+int sameType(Types type1, Types type2) {
+	return (type1 == type2 || (type2 == BYTES && type1 == INTS));
+}
+
+int sameTypeEnums(Types type1, Types type2) {
+	return ((type2 == ENUMS && type1 == ENUMS_TYPE) || (type2 == ENUMS_TYPE && type1 == ENUMS_TYPE));
+}
+
+
+void whileCreate() {
+	TablesStack* table_id = new TablesStack();
+	SymbolTable* sym = new SymbolTable("while");
+    table_id->tables.push_back(sym);
+	stack_table.push_back(table_id);
+	int last_offset = offset_vector[offset_vector.size() - 1];
+	offset_vector.push_back(last_offset);
+}
+
+bool isLoop() {
+	string str = "while";
+    return findID(str);
+}
+
+bool findID(string id) {
+	int index = stack_table.size() - 1;
+	while(index >= 0) {
+		TablesStack* table_id = stack_table[index];
+		for (int i = 0; i < table_id->tables.size(); i++) {
+			 if (table_id->tables[i]->name == id) {
+				return true;
+			}
+			
+		
+		}
+		index--;
+	}
+	return false;
+}
+
+string getEnumID(string id) {
+	int index = stack_table.size() - 1;
+	while(index >= 0) {
+		TablesStack* table_id = stack_table[index];
+		for (int i = 0; i < table_id->tables.size(); i++) {
+			 if (table_id->tables[i]->name == id) {
+				return table_id->tables[i]->enum_id;
+			}
+			
+		
+		}
+		index--;
+	}
+	return "";
+}
+
+void scopeDelete() {
+	TablesStack* last_table = stack_table[stack_table.size() - 1];
+	stack_table.pop_back();
+	for (int i = 0; i < last_table->tables.size(); i++) {
+		if (last_table->tables[i]) {
+			delete last_table->tables[i];
+		}
+	}
+	last_table->tables.clear();
+	delete last_table;
+	offset_vector.pop_back();
+}
+
+void insertToStackTable(IdData* id, Types type) {
+	int index = stack_table.size() - 1;	
+	TablesStack* table_id = stack_table[index];
+	int size = 1; 
+    int offset_index = offset_vector.size() - 1;	
+	int curr_offset = offset_vector[offset_index];
+	offset_vector[offset_index] += size;
+    SymbolTable* sym = new SymbolTable(id->getValue(), curr_offset, type, "");
+	sym->is_fun = false;
+	table_id->tables.push_back(sym);
+}
+
+void insertEnumToStackTable(IdData* id, Types type, string name) {
+	int index = stack_table.size() - 1;	
+	TablesStack* table_id = stack_table[index];
+	int size = 1; 
+    int offset_index = offset_vector.size() - 1;	
+	int curr_offset = offset_vector[offset_index];
+	offset_vector[offset_index] += size;
+    SymbolTable* sym = new SymbolTable(id->getValue(), curr_offset, type, name);
+	sym->is_fun = false;
+	table_id->tables.push_back(sym);
+}
+
+void scopeBegin() {
+	int curr_offset = offset_vector[offset_vector.size() - 1];
+	offset_vector.push_back(curr_offset);		
+    stack_table.push_back(new TablesStack());
+}
+
+void scopeEnd() {
+	//endScope();
+	TablesStack* curr_table = stack_table[stack_table.size() - 1];
+	for (int i = 0; i < curr_table->tables.size(); i++) {
+		SymbolTable* sym = curr_table->tables[i];
+		if (sym->type == ENUMS_TYPE) {
+			string enum_str = "enum " + sym->enum_id;
+				//if (sym->enum_id != "")
+					//printID(sym->name, sym->offset, enum_str);
+				for (int j = 0; j < enums_list.size(); j++) {
+					if (sym->name == enums_list[j]->name) {
+						vector<string> en_list;
+						getEnums(enums_list[j]->enumList, en_list);
+						//printEnumType(enums_list[j]->name, en_list);
+					}
+				}
+		
+		}/* else {
+			if (sym->type != ENUMS )
+				//printID(sym->name, sym->offset, typesAsString[sym->type]);
+		}*/
+		//printID(sym->name, sym->offset, typesAsString[sym->type]);	
+	}
+	scopeDelete();
+}
+
+void outerScopeBegin() {
+	offset_vector.push_back(0);
+	TablesStack* most_outer_scope = new TablesStack();
+	
+	string tmp = genReg();
+	string tmp1 = genReg();
+	string tmp2 = genReg();
+	string tmp3 = genReg();
+	CodeBuffer::instance().emit("declare i32 @printf(i8*, ...)");
+	CodeBuffer::instance().emit("declare void @exit(i32)"); //exit(1)
+	CodeBuffer::instance().emitGlobal("@.int_specifier = constant [4 x i8] c\"%d\\0A\\00\"");
+	CodeBuffer::instance().emitGlobal("@.str_specifier = constant [4 x i8] c\"%s\\0A\\00\"");
+	
+	CodeBuffer::instance().emit("define void @printi(i32) {");
+	CodeBuffer::instance().emit(tmp2 + " = call i32 (i8*, ...) @printf(i8* getelementptr ([4 x i8], [4 x i8]* @.int_specifier, i32 0, i32 0), i32 %0)");
+	CodeBuffer::instance().emit("ret void }");
+	
+	CodeBuffer::instance().emit("define void @print(i8*) {");
+	CodeBuffer::instance().emit(tmp3 + " = call i32 (i8*, ...) @printf(i8* getelementptr ([4 x i8], [4 x i8]* @.str_specifier, i32 0, i32 0), i8* %0)");
+	CodeBuffer::instance().emit("ret void }");
+	
+	//CodeBuffer::instance().emitGlobal("div_zero:");
+	CodeBuffer::instance().emitGlobal("@.divzero = internal constant [23 x i8] c\"Error division by zero\\00\"");
+	//CodeBuffer::instance().emitGlobal("call void @print(i8* getelementptr ([24 x i8], [24 x i8]* @.divzero, i32 0, i32 0))");
+	//CodeBuffer::instance().emitGlobal("call void @exit(i32 1)");
+
+	
+	vector<Types> param1;
+	param1.push_back(STRINGS);
+	SymbolTable* sym1 = new SymbolTable("print", 0, VOIDS, param1);
+	sym1->is_fun = true;
+	most_outer_scope->tables.push_back(sym1);
+
+	vector<Types> param2;
+	param2.push_back(INTS);
+	SymbolTable* sym2 = new SymbolTable("printi", 0, VOIDS, param2);
+	sym2->is_fun = true;
+    most_outer_scope->tables.push_back(sym2);
+
+	stack_table.push_back(most_outer_scope);
+}
+
+void fromTypeToString(SymbolTable* sym, vector<Types>& types, vector<string>& strings) {
+	strings.clear();
+	for (int i = types.size() - 1; i >= 0; i--) {
+		if (types[i] == ENUMS_TYPE) {
+			string str = "enum " + sym->enum_params[i];
+			strings.push_back(str);
+		} else
+			strings.push_back(typesAsString[types[i]]);
+	}
+}
+
+void outerScopeEnd() {
+	TablesStack* curr_table = stack_table.back();
+	bool main_exists = false;
+	for (int i = 0; i < curr_table->tables.size(); i++) {
+		SymbolTable* sym = curr_table->tables[i];
+		if (sym->name == "main" && (sym->type == VOIDS) && sym->fun_param_types.size() == 0) {
+			main_exists = true;
+			break;
+		}
+	}
+	if (!main_exists) {
+		errorMainMissing();
+		exit(0);
+	}
+	//endScope();
+	 vector<string> params;
+	for (int i = 0; i < curr_table->tables.size(); i++) {
+		SymbolTable* sym = curr_table->tables[i];
+	    fromTypeToString(sym, sym->fun_param_types, params);
+		const string type_string = typesAsString[sym->type];
+		//if (sym->type != ENUMS && sym->type != ENUMS_TYPE)
+			//printID(sym->name, 0, makeFunctionType(type_string, params));
+	}
+	for (int i = 0; i < curr_table->tables.size(); i++) {
+		SymbolTable* sym = curr_table->tables[i];
+		if (sym->type == ENUMS_TYPE) {
+			string enum_str = "enum " + sym->enum_id;
+				if (sym->enum_id != "")
+				//	printID(sym->name, sym->offset, enum_str);
+				for (int j = 0; j < enums_list.size(); j++) {
+					if (sym->name == enums_list[j]->name) {
+						vector<string> en_list;
+						getEnums(enums_list[j]->enumList, en_list);
+						//printEnumType(enums_list[j]->name, en_list);
+					}
+				}
+		
+		}
+	} 
+	scopeDelete();
+}
+
+bool isInList(string enum_str, string var_name) { // inList()
+	for (int i = 0; i < enums_list.size(); i++) {
+		if (enum_str == enums_list[i]->name) {
+			for (int j = 0; j < enums_list[i]->enumList.size(); j++) {
+				if (enums_list[i]->enumList[j]->enum_name == var_name)
+					return true;
+			}
+		}
+	}
+	return false;
+}
+
+int getSerialEnum(string var_name) { // inList()
+	for (int i = 0; i < enums_list.size(); i++) {
+			for (int j = 0; j < enums_list[i]->enumList.size(); j++) {
+				if (enums_list[i]->enumList[j]->enum_name == var_name)
+					return j;
+			}
+		
+	}
+	return -1;
+}
+
+void getEnums(vector<TypeData*>& src, vector<string>& dst) {
+	dst.clear();
+	for (int i = 0; i < src.size(); i++) {
+			dst.push_back(src[i]->enum_name);
+	}
+}
+
+string genReg() {
+	string reg_num = to_string(reg_count);
+	string reg = "var" + reg_num;
+	reg_count++;
+    stringstream temp;
+    temp << "%" << reg ;
+    string s = temp.str();
+    return s;
+
+}
+
